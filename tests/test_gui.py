@@ -323,3 +323,204 @@ def test_quests_tab_empty_when_no_quests(qapp: QApplication, sample_json_path: P
     assert w._quest_entries == []
     # Quests tab is still enabled, just empty
     assert w._tabs.isTabEnabled(2)
+
+
+# -- Folder row / slot picker --------------------------------------------
+#
+# The folder row lives below the file row and lets the user paste a
+# long path (notably Wine/Proton ``AppData/LocalLow/...`` prefixes) and
+# pick a save slot from a dropdown. These tests exercise the rescan
+# logic, slot change handler, and graceful failure modes.
+
+
+def test_folder_field_prefilled_with_default_save_dir(
+    qapp: QApplication, tmp_path, monkeypatch
+) -> None:
+    """On startup the folder field shows the default save dir (or empty
+    if the platform default doesn't exist)."""
+    from permit_save_editor.ui import main_window as mw
+
+    monkeypatch.setattr(mw, "default_save_dir", lambda: tmp_path / "PotionPermit")
+    w = MainWindow()
+    # The field text matches the patched default
+    assert w._folder_path_edit.text() == str(tmp_path / "PotionPermit")
+    # Folder doesn't exist → combo disabled, status "0 slots"
+    assert not w._slot_combo.isEnabled()
+    assert w._folder_status.text() == "0 slots"
+
+
+def test_rescan_populates_slot_combo_with_rjson_files(
+    qapp: QApplication, tmp_path
+) -> None:
+    """A folder with .rjson files gets one combo item per file, sorted."""
+    # Create 3 .rjson files with non-sorted names to verify sort order
+    (tmp_path / "GameSave3.rjson").write_bytes(b"")
+    (tmp_path / "GameSave1.rjson").write_bytes(b"")
+    (tmp_path / "GameSave2.rjson").write_bytes(b"")
+    w = MainWindow()
+    w._rescan_folder(tmp_path)
+    assert w._slot_combo.isEnabled()
+    items = [w._slot_combo.itemText(i) for i in range(w._slot_combo.count())]
+    assert items == ["GameSave1.rjson", "GameSave2.rjson", "GameSave3.rjson"]
+    assert w._folder_status.text() == "3 slots"
+
+
+def test_rescan_stores_full_path_in_item_data(
+    qapp: QApplication, tmp_path
+) -> None:
+    """Each combo item's userData is the absolute path (for the file field)."""
+    save = tmp_path / "GameSave2.rjson"
+    save.write_bytes(b"")
+    w = MainWindow()
+    w._rescan_folder(tmp_path)
+    full = w._slot_combo.itemData(0)
+    assert full == str(save)
+
+
+def test_rescan_ignores_non_rjson_files(
+    qapp: QApplication, tmp_path
+) -> None:
+    """Plain .json exports and other files are not slot candidates."""
+    (tmp_path / "GameSave1.rjson").write_bytes(b"")
+    (tmp_path / "GameSave1.json").write_bytes(b"")  # plain export, not a slot
+    (tmp_path / "notes.txt").write_bytes(b"")
+    (tmp_path / "GameSave2.rjson.bak").write_bytes(b"")  # backup
+    w = MainWindow()
+    w._rescan_folder(tmp_path)
+    items = [w._slot_combo.itemText(i) for i in range(w._slot_combo.count())]
+    assert items == ["GameSave1.rjson"]
+
+
+def test_rescan_handles_nonexistent_folder(
+    qapp: QApplication, tmp_path
+) -> None:
+    """A non-existent path clears the combo without raising."""
+    w = MainWindow()
+    w._slot_combo.addItem("leftover", userData="/some/old/path")
+    w._rescan_folder(tmp_path / "does_not_exist")
+    # Rescan drops everything regardless of what was there
+    assert w._slot_combo.count() == 0
+    assert not w._slot_combo.isEnabled()
+    assert w._folder_status.text() == "0 slots"
+
+
+def test_rescan_handles_empty_folder(
+    qapp: QApplication, tmp_path
+) -> None:
+    """A real folder with no .rjson files shows a disabled placeholder."""
+    # Make the folder exist but empty
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    w = MainWindow()
+    w._rescan_folder(empty)
+    assert w._slot_combo.count() == 1
+    assert w._slot_combo.itemText(0) == "(no saves in this folder)"
+    assert not w._slot_combo.isEnabled()
+    assert w._folder_status.text() == "0 slots"
+
+
+def test_rescan_handles_path_that_is_a_file(
+    qapp: QApplication, tmp_path
+) -> None:
+    """A path that points to a file (not a directory) is treated as bad."""
+    f = tmp_path / "a_file.rjson"
+    f.write_bytes(b"")
+    w = MainWindow()
+    w._rescan_folder(f)
+    assert w._slot_combo.count() == 0
+    assert not w._slot_combo.isEnabled()
+
+
+def test_rescan_with_none_clears_combo(qapp: QApplication) -> None:
+    """Passing None clears the combo and disables it."""
+    w = MainWindow()
+    w._slot_combo.addItem("leftover", userData="x")
+    w._rescan_folder(None)
+    assert w._slot_combo.count() == 0
+    assert not w._slot_combo.isEnabled()
+    assert w._folder_status.text() == "0 slots"
+
+
+def test_rescan_replaces_previous_results(
+    qapp: QApplication, tmp_path
+) -> None:
+    """A second rescan replaces (not appends) the prior combo contents."""
+    folder_a = tmp_path / "a"
+    folder_b = tmp_path / "b"
+    folder_a.mkdir()
+    folder_b.mkdir()
+    (folder_a / "GameSave1.rjson").write_bytes(b"")
+    (folder_b / "GameSave1.rjson").write_bytes(b"")
+    (folder_b / "GameSave2.rjson").write_bytes(b"")
+    w = MainWindow()
+    w._rescan_folder(folder_a)
+    assert w._slot_combo.count() == 1
+    w._rescan_folder(folder_b)
+    items = [w._slot_combo.itemText(i) for i in range(w._slot_combo.count())]
+    assert items == ["GameSave1.rjson", "GameSave2.rjson"]
+    # And the data points to folder_b
+    assert Path(w._slot_combo.itemData(0)).parent == folder_b
+    assert w._folder_status.text() == "2 slots"
+
+
+def test_slot_change_populates_file_path_field(
+    qapp: QApplication, tmp_path
+) -> None:
+    """Selecting a combo item copies its full path into the file field."""
+    save1 = tmp_path / "GameSave1.rjson"
+    save2 = tmp_path / "GameSave2.rjson"
+    save1.write_bytes(b"")
+    save2.write_bytes(b"")
+    w = MainWindow()
+    w._rescan_folder(tmp_path)
+    # Pick the second slot
+    w._slot_combo.setCurrentIndex(1)
+    assert w._path_edit.text() == str(save2)
+    # Pick the first slot
+    w._slot_combo.setCurrentIndex(0)
+    assert w._path_edit.text() == str(save1)
+
+
+def test_on_folder_changed_rescans_with_expanduser(
+    qapp: QApplication, tmp_path, monkeypatch
+) -> None:
+    """Typing a ``~`` path in the folder field + Enter expands it."""
+    # Symlink tmp_path to a name under a fake home so expanduser resolves
+    # to a real directory. Using a real subdir of tmp_path keeps the test
+    # self-contained — we just verify expanduser ran (no error raised).
+    folder = tmp_path / "savedir"
+    folder.mkdir()
+    (folder / "GameSave1.rjson").write_bytes(b"")
+    w = MainWindow()
+    # Simulate the user typing the path and pressing Enter
+    w._folder_path_edit.setText(str(folder))
+    w._on_folder_changed()
+    assert w._slot_combo.isEnabled()
+    assert w._slot_combo.count() == 1
+
+
+def test_on_folder_changed_empty_clears_combo(qapp: QApplication) -> None:
+    """Clearing the folder field empties the combo."""
+    w = MainWindow()
+    w._slot_combo.addItem("leftover", userData="x")
+    w._folder_path_edit.setText("")
+    w._on_folder_changed()
+    assert w._slot_combo.count() == 0
+
+
+def test_rescan_blocks_signals_during_population(
+    qapp: QApplication, tmp_path
+) -> None:
+    """Rescan must not fire _on_slot_changed for each added item.
+
+    Without blockSignals, adding items via addItem would trigger
+    activated[int]=currentIndex for each, which would overwrite the
+    file path field with stale combos.
+    """
+    (tmp_path / "GameSave1.rjson").write_bytes(b"")
+    (tmp_path / "GameSave2.rjson").write_bytes(b"")
+    w = MainWindow()
+    w._path_edit.setText("MANUAL_VALUE")
+    w._rescan_folder(tmp_path)
+    # File path field should still be the manual value
+    assert w._path_edit.text() == "MANUAL_VALUE"

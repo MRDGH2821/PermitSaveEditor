@@ -2,9 +2,16 @@
 
 Layout:
 
-* Top bar: ``Browse…`` button, editable save-path field, ``Load`` button,
-  ``Save`` button, ``Download Plain JSON`` button. The path field doubles as
-  a status display and a manual-entry point — paste a path, hit Load.
+* Top bar is two rows:
+  - **File row** — ``Browse File…`` button, editable save-path field,
+    ``Load`` / ``Save`` / ``Download Plain JSON`` buttons. Paste a path,
+    hit ``Load``.
+  - **Folder row** — ``Browse Folder…`` button, editable folder-path
+    field, ``Slot: GameSaveN.rjson  ▼`` dropdown, slot count label.
+    The folder row is friendlier for Wine/Proton users (Heroic, Lutris,
+    Steam) who want to paste a long ``AppData/LocalLow`` prefix path
+    and pick a save slot from a dropdown rather than wrestle with a
+    file dialog. Either row works to load a save.
 * ``General`` tab    — name/dog name/gender, gold/wood/stone, three skill
   levels, three fishing exp slots, five color pickers.
 * ``Unlockables`` tab — eight bulk-unlock buttons.
@@ -38,6 +45,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QColorDialog,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -167,6 +175,11 @@ class MainWindow(QMainWindow):
         self._quest_list_layout: QVBoxLayout | None = None
 
         self._build_ui()
+        # Pre-fill the folder row with the platform-native save dir
+        # and scan it so the user sees available slots immediately.
+        # Wine/Proton users can then paste over this and rescan.
+        self._folder_path_edit.setText(str(default_save_dir()))
+        self._rescan_folder(default_save_dir())
         self._update_button_states()
 
     # -- UI construction --------------------------------------------------
@@ -185,15 +198,43 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._build_quests_tab(), "Quests")
         root.addWidget(self._tabs, 1)
 
-    def _build_top_bar(self) -> QHBoxLayout:
-        bar = QHBoxLayout()
-        bar.setSpacing(8)
+    def _build_top_bar(self) -> QVBoxLayout:
+        """Two-row top bar: file mode (existing) + folder mode (new).
 
-        self._browse_btn = QPushButton("Browse…")
-        self._browse_btn.setFixedWidth(80)
-        self._browse_btn.setToolTip("Open a file dialog to pick a .rjson / .json save.")
+        Row 1 — file mode:
+            ``[Browse File…] [file path field] [Load] [Save] [Download Plain JSON]``
+
+        Row 2 — folder mode:
+            ``[Browse Folder…] [folder path field] [Slot: GameSave1.rjson  ▼]  N slots``
+
+        Either row works to load a save; row 2 is friendlier for
+        Wine/Proton users who want to paste a long ``AppData/LocalLow``
+        prefix path and pick a save slot from a dropdown rather than
+        wrestle with a file dialog.
+        """
+        bar = QVBoxLayout()
+        bar.setSpacing(4)
+        bar.addLayout(self._build_file_row())
+        bar.addLayout(self._build_folder_row())
+        return bar
+
+    def _build_file_row(self) -> QHBoxLayout:
+        """File mode: pick a single .rjson/.json file and load it.
+
+        Identical to the pre-folder-row behaviour — Browse opens a
+        file dialog, the path field accepts pasted paths, Load is the
+        universal trigger.
+        """
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        self._browse_btn = QPushButton("Browse File…")
+        self._browse_btn.setFixedWidth(100)
+        self._browse_btn.setToolTip(
+            "Open a file dialog to pick a .rjson / .json save file."
+        )
         self._browse_btn.clicked.connect(self._on_browse)
-        bar.addWidget(self._browse_btn)
+        row.addWidget(self._browse_btn)
 
         self._path_edit = QLineEdit()
         self._path_edit.setPlaceholderText(
@@ -201,23 +242,86 @@ class MainWindow(QMainWindow):
             f"{default_save_dir()}/GameSave1.rjson)"
         )
         self._path_edit.returnPressed.connect(self._on_load_path)
-        bar.addWidget(self._path_edit, 1)
+        row.addWidget(self._path_edit, 1)
 
         self._load_btn = QPushButton("Load")
         self._load_btn.setFixedWidth(60)
         self._load_btn.setToolTip("Load the save whose path is in the field above.")
         self._load_btn.clicked.connect(self._on_load_path)
-        bar.addWidget(self._load_btn)
+        row.addWidget(self._load_btn)
 
         self._save_btn = QPushButton("Save")
         self._save_btn.setFixedWidth(60)
         self._save_btn.clicked.connect(self._on_save)
-        bar.addWidget(self._save_btn)
+        row.addWidget(self._save_btn)
 
         self._plain_btn = QPushButton("Download Plain JSON")
         self._plain_btn.clicked.connect(self._on_export_plain_json)
-        bar.addWidget(self._plain_btn)
-        return bar
+        row.addWidget(self._plain_btn)
+        return row
+
+    def _build_folder_row(self) -> QHBoxLayout:
+        """Folder mode: pick a save folder, then choose a slot from the dropdown.
+
+        The folder field is editable (paste-friendly) and pre-populated
+        with :func:`default_save_dir` on startup. ``Browse Folder…``
+        opens a directory picker, the slot combo below is populated
+        with ``*.rjson`` files in the chosen folder, and selecting a
+        slot copies its full path into the file-row field so a
+        subsequent ``Load`` opens it.
+        """
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        self._browse_folder_btn = QPushButton("Browse Folder…")
+        self._browse_folder_btn.setFixedWidth(100)
+        self._browse_folder_btn.setToolTip(
+            "Open a directory picker to choose the folder containing "
+            "the .rjson save slots."
+        )
+        self._browse_folder_btn.clicked.connect(self._on_browse_folder)
+        row.addWidget(self._browse_folder_btn)
+
+        self._folder_path_edit = QLineEdit()
+        self._folder_path_edit.setPlaceholderText(
+            "Save folder — paste a path (Wine/Proton users see tooltip)"
+        )
+        self._folder_path_edit.setToolTip(
+            "Path to the folder containing GameSave1.rjson, "
+            "GameSave2.rjson, etc.\n\n"
+            "Defaults to the native Linux save location, but Wine/Proton "
+            "(Heroic, Lutris, Steam) users should paste their prefix path:\n"
+            "  <prefix>/drive_c/users/steamuser/AppData/LocalLow/"
+            "MasshiveMedia/Potion Permit"
+        )
+        # Rescan on Enter or focus-out so the user can paste + see slots.
+        self._folder_path_edit.returnPressed.connect(self._on_folder_changed)
+        row.addWidget(self._folder_path_edit, 1)
+
+        slot_label = QLabel("Slot:")
+        slot_label.setStyleSheet(_STATUS_QSS)
+        row.addWidget(slot_label)
+
+        self._slot_combo = QComboBox()
+        self._slot_combo.setMinimumWidth(170)
+        self._slot_combo.setToolTip(
+            "All .rjson files in the folder above, sorted. "
+            "Selecting a slot copies its full path into the file field."
+        )
+        # currentIndexChanged (not ``activated``) so programmatic
+        # changes (e.g. tests using setCurrentIndex, or future
+        # auto-pick behaviour) also propagate. ``_rescan_folder``
+        # wraps the population in blockSignals() so the clear+repopulate
+        # cycle doesn't fire a spurious slot-change event.
+        self._slot_combo.currentIndexChanged.connect(self._on_slot_changed)
+        self._slot_combo.setEnabled(False)  # populated on first scan
+        row.addWidget(self._slot_combo)
+
+        self._folder_status = QLabel("0 slots")
+        self._folder_status.setStyleSheet(_STATUS_QSS)
+        self._folder_status.setFixedWidth(60)
+        row.addWidget(self._folder_status)
+        return row
 
     def _build_general_tab(self) -> QWidget:
         page = QWidget()
@@ -710,7 +814,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "No path",
-                "Enter a save file path in the field above, or use Browse….",
+                "Enter a save file path in the field above, or use "
+                "Browse File… / Browse Folder….",
             )
             return
         path = Path(text).expanduser()
@@ -718,6 +823,91 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"File not found:\n{path}")
             return
         self.load_from_path(path)
+
+    def _on_browse_folder(self) -> None:
+        """Open a directory picker to choose the save folder.
+
+        Uses ``QFileDialog.getExistingDirectory`` (the directory-only
+        variant of the standard file dialog) so the user can navigate
+        to deep Wine prefix paths without typing them by hand. On
+        accept, the folder field is updated and the slot combo is
+        rescanned.
+        """
+        start = self._folder_path_edit.text().strip() or str(default_save_dir())
+        folder_str = QFileDialog.getExistingDirectory(
+            self,
+            "Select Save Folder",
+            start,
+            QFileDialog.ShowDirsOnly,
+        )
+        if not folder_str:
+            return
+        self._folder_path_edit.setText(folder_str)
+        self._rescan_folder(Path(folder_str))
+
+    def _on_folder_changed(self) -> None:
+        """Rescan the folder field's path and repopulate the slot combo.
+
+        Triggered on Enter inside the folder field (the user just
+        pasted a path) and on focus-out. An empty field clears the
+        combo; a non-existent path is left empty with the status label
+        set to ``0 slots`` rather than raising — the user is still
+        typing.
+        """
+        text = self._folder_path_edit.text().strip()
+        if not text:
+            self._rescan_folder(None)
+            return
+        self._rescan_folder(Path(text).expanduser())
+
+    def _on_slot_changed(self, index: int) -> None:
+        """Copy the selected slot's full path into the file path field.
+
+        We don't auto-load — the user has to click ``Load`` to confirm.
+        That keeps the load flow single-source (the file field + the
+        ``_on_load_path`` handler) and avoids loading a save the user
+        just glanced at.
+        """
+        if index < 0:
+            return
+        full_path = self._slot_combo.itemData(index)
+        if full_path:
+            self._path_edit.setText(full_path)
+
+    def _rescan_folder(self, folder: Path | None) -> None:
+        """Populate the slot combo with ``*.rjson`` files in ``folder``.
+
+        Behaviour:
+          * ``folder is None`` or path doesn't exist or isn't a directory:
+            combo is cleared and disabled, status shows ``0 slots``.
+          * folder exists but has no ``*.rjson`` files: combo shows a
+            single disabled placeholder, status shows ``0 slots``.
+          * folder has saves: one combo item per ``*.rjson`` (sorted),
+            full path stashed in ``userData``; status shows ``N slots``.
+
+        Plain ``.json`` files (editor exports) are intentionally
+        excluded — they're not save slots the game recognises.
+        """
+        self._slot_combo.blockSignals(True)
+        self._slot_combo.clear()
+        if folder is None or not folder.is_dir():
+            self._slot_combo.setEnabled(False)
+            self._folder_status.setText("0 slots")
+            self._slot_combo.blockSignals(False)
+            return
+        saves = sorted(folder.glob(f"*{RJSON_SUFFIX}"))
+        if not saves:
+            self._slot_combo.addItem("(no saves in this folder)", userData=None)
+            self._slot_combo.setEnabled(False)
+            self._folder_status.setText("0 slots")
+            self._slot_combo.blockSignals(False)
+            return
+        for save in saves:
+            self._slot_combo.addItem(save.name, userData=str(save))
+        self._slot_combo.setEnabled(True)
+        count = len(saves)
+        self._folder_status.setText(f"{count} slot{'s' if count != 1 else ''}")
+        self._slot_combo.blockSignals(False)
 
     def _on_save(self) -> None:
         if self._save is None:
