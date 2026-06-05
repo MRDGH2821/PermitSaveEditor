@@ -316,6 +316,7 @@ paket-files/
 __pycache__/
 *.pyc
 
+
 # Cake - Uncomment if you are using it
 # tools/**
 # !tools/packages.config
@@ -361,3 +362,51 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Python build / venv
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.pyright/
+
+# uv
+uv.lock
+
+# Generated / output directories (matches original .NET repo's policy)
+obfuscated/
+deobfuscated/
+output/
+*.bak
+log.txt
+
+# Original .NET build artifacts (in PermitSaveEditor/ subdir)
+PermitSaveEditor/bin/
+PermitSaveEditor/obj/
+*.user
+*.suo
+.vs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Other
+/savefiles
