@@ -1,8 +1,10 @@
 """Smoke test for the PySide6 GUI.
 
 Runs the main window in the headless ``offscreen`` Qt platform. We don't
-simulate user input — we just verify the window can be constructed, the
-load path works, and the widgets are populated correctly.
+simulate user input directly — we just verify the window can be
+constructed, the load path works, and the widgets are populated
+correctly. Sub-task toggles are exercised by calling ``.click()`` on the
+checkboxes, which Qt dispatches as a real click event.
 """
 
 from __future__ import annotations
@@ -124,67 +126,194 @@ def test_quests_tab_lists_active_quests(
     w.load_from_path(sample_json_path_with_quests)
     assert w._tabs.isTabEnabled(2)
     assert len(w._quest_entries) == len(sample_quests_dict)
-    # The first quest is partially complete (1/3), the second is incomplete (0/2),
-    # the third has no requirements and the toggle should be disabled.
+    # quest_intro is KILL_MONSTERS with 2 sub-tasks, one complete (1/2).
     first, second, third = w._quest_entries
-    assert "1 / 3 complete" in first.status_label.text()
-    assert "0 / 2 complete" in second.status_label.text()
-    assert "No requirement checkers" in third.status_label.text()
-    assert not first.toggle.isChecked()
-    assert not second.toggle.isChecked()
-    assert not third.toggle.isEnabled()  # no requirements → disabled toggle
+    assert "1 / 2 complete" in first.progress_label.text()
+    assert len(first.subtasks) == 2
+    # quest_heal is TRIGGER_EVENT with 2 sub-tasks, none complete (0/2).
+    assert "0 / 2 complete" in second.progress_label.text()
+    assert len(second.subtasks) == 2
+    # quest_free has no requirement checkers — no sub-task rows.
+    assert "No sub-tasks" in third.progress_label.text()
+    assert third.subtasks == []
 
 
-def test_quest_toggle_mutates_underlying_dict(
+def test_subtask_checkboxes_reflect_initial_state(
     qapp: QApplication, sample_json_path_with_quests: Path
 ) -> None:
-    """Toggling a quest's button flips every requirement's ``complete`` flag in the save."""
+    """Each sub-task's checkbox is pre-checked iff its checker says complete."""
     w = MainWindow()
     w.load_from_path(sample_json_path_with_quests)
-    second = w._quest_entries[1]
-    # Pre-condition: 0/2 complete
-    assert all(
-        r["complete"] is False for r in second.quest["questRequirementCheckerList"]
-    )
-
-    # Simulate the user clicking "Mark Complete"
-    second.toggle.click()
-    assert second.toggle.isChecked()
-    # Underlying dict is mutated in place — every requirement is now True
-    assert all(
-        r["complete"] is True for r in second.quest["questRequirementCheckerList"]
-    )
-    # The status label updates immediately
-    assert "2 / 2 complete" in second.status_label.text()
-    # The save model is the same object — its active_quest_list reflects the change
-    save_reqs = w._save.active_quest_list[1]["questRequirementCheckerList"]
-    assert all(r["complete"] is True for r in save_reqs)
-
-    # Clicking again flips them back to incomplete
-    second.toggle.click()
-    assert not second.toggle.isChecked()
-    assert all(
-        r["complete"] is False for r in second.quest["questRequirementCheckerList"]
-    )
-    assert "0 / 2 complete" in second.status_label.text()
+    intro = w._quest_entries[0]
+    assert intro.subtasks[0].checkbox.isChecked()  # complete: True
+    assert not intro.subtasks[1].checkbox.isChecked()  # complete: False
 
 
-def test_quest_toggle_persists_to_saved_file(
+def test_subtask_checkbox_uses_requirement_text(
+    qapp: QApplication, sample_json_path_with_quests: Path
+) -> None:
+    """The label next to each checkbox shows the requirementText, not prefixText.
+
+    The QLabel renders the requirement as rich text (so color tags
+    become Qt <font> spans), but ``.text()`` returns the plain-text
+    form with the tags stripped. The underlying
+    :func:`permit_save_editor.ui.main_window._render_requirement_text`
+    is tested separately below.
+    """
+    w = MainWindow()
+    w.load_from_path(sample_json_path_with_quests)
+    intro = w._quest_entries[0]
+    blackpaw_label = intro.subtasks[0].label.text()
+    wolf_label = intro.subtasks[1].label.text()
+    # Substantive content survives (color tags are stripped by .text()).
+    assert "Blackpaw" in blackpaw_label
+    assert "(2/5)" in blackpaw_label
+    assert "Wolf" in wolf_label
+    assert "(0/3)" in wolf_label
+    # Trailing tab on the raw string is stripped.
+    assert not blackpaw_label.endswith("\t")
+    assert not wolf_label.endswith("\t")
+
+
+def test_render_requirement_text_converts_color_tags() -> None:
+    """Pyglet ``<#rrggbb>...</color>`` tags become Qt ``<font color=…>`` spans."""
+    from permit_save_editor.ui.main_window import _render_requirement_text
+
+    converted = _render_requirement_text("Defeat <#ff1d1d>Blackpaw</color>\t(2/5)")
+    assert "Blackpaw" in converted
+    assert "(2/5)" in converted
+    assert '<font color="#ff1d1d">Blackpaw</font>' in converted
+    # Pyglet-style tags are gone.
+    assert "<#ff1d1d>" not in converted
+    assert "</color>" not in converted
+
+
+def test_render_requirement_text_passes_through_unknown_text() -> None:
+    """Strings without color tags are returned as-is."""
+    from permit_save_editor.ui.main_window import _render_requirement_text
+
+    assert _render_requirement_text("plain text") == "plain text"
+    assert _render_requirement_text("") == ""
+
+
+def test_subtask_toggle_flips_only_that_subtask(
+    qapp: QApplication, sample_json_path_with_quests: Path
+) -> None:
+    """Checking one sub-task's checkbox must not touch any other sub-task."""
+    w = MainWindow()
+    w.load_from_path(sample_json_path_with_quests)
+    intro = w._quest_entries[0]
+    # Pre-condition: sub-task 0 is checked, sub-task 1 is not
+    assert intro.subtasks[0].checkbox.isChecked()
+    assert not intro.subtasks[1].checkbox.isChecked()
+
+    # Toggle sub-task 0 OFF
+    intro.subtasks[0].checkbox.click()
+    assert not intro.subtasks[0].checkbox.isChecked()
+    # Sub-task 1 stays unchecked — independent state
+    assert not intro.subtasks[1].checkbox.isChecked()
+    # Underlying dict matches
+    assert intro.quest["questRequirementCheckerList"][0]["complete"] is False
+    assert intro.quest["questRequirementCheckerList"][1]["complete"] is False
+    # Progress label updated
+    assert "0 / 2 complete" in intro.progress_label.text()
+
+    # Toggle sub-task 0 back ON
+    intro.subtasks[0].checkbox.click()
+    assert intro.subtasks[0].checkbox.isChecked()
+    assert "1 / 2 complete" in intro.progress_label.text()
+
+
+def test_subtask_complete_bumps_underlying_current(
+    qapp: QApplication, sample_json_path_with_quests: Path
+) -> None:
+    """Marking a KILL_MONSTERS sub-task complete must bump CURRENT → TARGET.
+
+    This is the whole reason the editor exists — without bumping the
+    CURRENT count, the game would re-evaluate the sub-task on next load
+    and reset the checker. Verifies the wiring between
+    :func:`mark_subtask_complete` and the checkbox.
+    """
+    w = MainWindow()
+    w.load_from_path(sample_json_path_with_quests)
+    intro = w._quest_entries[0]
+    # Pre-condition: CURRENT_KILL_MONSTER[1] (Wolf) is 0, TARGET is 3
+    kills = intro.quest["questKillReq"]
+    assert kills["CURRENT_KILL_MONSTER"][0]["count"] == 2  # Blackpaw
+    assert kills["CURRENT_KILL_MONSTER"][1]["count"] == 0  # Wolf
+    assert kills["TARGET_KILL_MONSTER"][1]["count"] == 3
+
+    # Mark Wolf sub-task (index 1) complete
+    intro.subtasks[1].checkbox.click()
+
+    # CURRENT bumped to TARGET for the Wolf entry only
+    assert kills["CURRENT_KILL_MONSTER"][0]["count"] == 2  # Blackpaw untouched
+    assert kills["CURRENT_KILL_MONSTER"][1]["count"] == 3  # Wolf bumped
+    assert intro.subtasks[1].checker["complete"] is True
+
+
+def test_subtask_trigger_event_complete_flips_triggered(
+    qapp: QApplication, sample_json_path_with_quests: Path
+) -> None:
+    """TRIGGER_EVENT sub-task completion sets CURRENT[].triggered = True."""
+    w = MainWindow()
+    w.load_from_path(sample_json_path_with_quests)
+    heal = w._quest_entries[1]
+    events = heal.quest["questEventReq"]
+    assert events["CURRENT_EVENT_TRIGGERED"][0]["triggered"] is False
+
+    # Mark the first sub-task complete
+    heal.subtasks[0].checkbox.click()
+
+    assert events["CURRENT_EVENT_TRIGGERED"][0]["triggered"] is True
+    # Second sub-task's CURRENT is untouched (independence)
+    assert events["CURRENT_EVENT_TRIGGERED"][1]["triggered"] is False
+
+
+def test_subtask_uncheck_leaves_current_intact(
+    qapp: QApplication, sample_json_path_with_quests: Path
+) -> None:
+    """Unchecking a sub-task must NOT reset the underlying CURRENT count.
+
+    The user has real progress we'd rather not throw away. The flag
+    flips back to False, but the in-game count is preserved.
+    """
+    w = MainWindow()
+    w.load_from_path(sample_json_path_with_quests)
+    intro = w._quest_entries[0]
+    # Blackpaw starts checked (complete=True) with CURRENT=2/5.
+    # Re-check (no-op visually) then uncheck, then re-check to bump to 5.
+    assert intro.subtasks[0].checkbox.isChecked()
+    # Uncheck first — CURRENT must stay at 2 (the in-game value)
+    intro.subtasks[0].checkbox.click()
+    assert not intro.subtasks[0].checkbox.isChecked()
+    assert intro.quest["questKillReq"]["CURRENT_KILL_MONSTER"][0]["count"] == 2
+    # Re-check — CURRENT bumps to TARGET (5)
+    intro.subtasks[0].checkbox.click()
+    assert intro.quest["questKillReq"]["CURRENT_KILL_MONSTER"][0]["count"] == 5
+    # Uncheck again — CURRENT stays at 5 (preserve real progress)
+    intro.subtasks[0].checkbox.click()
+    assert not intro.subtasks[0].checkbox.isChecked()
+    assert intro.quest["questKillReq"]["CURRENT_KILL_MONSTER"][0]["count"] == 5
+
+
+def test_subtask_state_persists_to_saved_file(
     qapp: QApplication, sample_json_path_with_quests: Path, tmp_path
 ) -> None:
-    """Toggling and then saving writes the new state to disk and round-trips it."""
+    """Toggling a sub-task and saving writes the new state to disk."""
     from permit_save_editor.io import load_save, save_save
 
     w = MainWindow()
     w.load_from_path(sample_json_path_with_quests)
-    # Mark the first quest complete
-    w._quest_entries[0].toggle.click()
+    # Mark the second sub-task of quest_intro complete
+    w._quest_entries[0].subtasks[1].checkbox.click()
     # Save to a new path
     out = tmp_path / "Out.rjson"
     save_save(w._read_widgets_into_save(), out, backup=False)
     reloaded = load_save(out)
     reqs = reloaded.active_quest_list[0]["questRequirementCheckerList"]
-    assert all(r["complete"] is True for r in reqs)
+    assert reqs[0]["complete"] is True   # unchanged from fixture
+    assert reqs[1]["complete"] is True   # newly toggled
 
 
 def test_quests_tab_empty_when_no_quests(qapp: QApplication, sample_json_path: Path) -> None:

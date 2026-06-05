@@ -226,36 +226,81 @@ def sample_plain_path(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def sample_quests_dict() -> list[dict]:
-    """Three active quests covering: partial completion, all-incomplete, no-reqs."""
+    """Three active quests covering the editor's hot paths.
+
+    * ``quest_intro``   — KILL_MONSTERS, 2 sub-tasks, one complete (1/2).
+    * ``quest_heal``    — TRIGGER_EVENT, 2 sub-tasks, none complete (0/2).
+    * ``quest_free``    — no requirement checkers at all.
+
+    The kill quest's ``questKillReq`` lets us verify the GUI's
+    per-sub-task ``CURRENT_X`` bump behaviour on toggle.
+    """
     return [
         {
             "npcID": "npc_mayor",
-            "questState": "InProgress",
+            "questState": "TAKEN",
             "questGiverName": "Mayor",
             "questID": "quest_intro",
             "questName": "Welcome to Moon Brook",
             "questActive": True,
+            "questReqType": "KILL_MONSTERS",
+            "questKillReq": {
+                "CURRENT_KILL_MONSTER": [
+                    {"monster": "BLACKPAW", "count": 2},
+                    {"monster": "WOLF", "count": 0},
+                ],
+                "TARGET_KILL_MONSTER": [
+                    {"monster": "BLACKPAW", "count": 5},
+                    {"monster": "WOLF", "count": 3},
+                ],
+            },
             "questRequirementCheckerList": [
-                {"complete": True},
-                {"complete": False},
-                {"complete": False},
+                {
+                    "complete": True,
+                    "prefixText": "Defeat Blackpaw\t",
+                    "requirementText": "Defeat Blackpaw\t(2/5)",
+                },
+                {
+                    "complete": False,
+                    "prefixText": "Defeat Wolf\t",
+                    "requirementText": "Defeat Wolf\t(0/3)",
+                },
             ],
         },
         {
             "npcID": "npc_healer",
-            "questState": "InProgress",
+            "questState": "TAKEN",
             "questGiverName": "Healer",
             "questID": "quest_heal",
             "questName": "Patient Care",
             "questActive": True,
+            "questReqType": "TRIGGER_EVENT",
+            "questEventReq": {
+                "CURRENT_EVENT_TRIGGERED": [
+                    {"eventID": "talk_to_healer", "triggered": False},
+                    {"eventID": "heal_npc", "triggered": False},
+                ],
+                "TARGET_EVENT_TRIGGERED": [
+                    {"eventID": "talk_to_healer", "triggered": False},
+                    {"eventID": "heal_npc", "triggered": False},
+                ],
+            },
             "questRequirementCheckerList": [
-                {"complete": False},
-                {"complete": False},
+                {
+                    "complete": False,
+                    "prefixText": "Talk to the Healer\t",
+                    "requirementText": "Talk to the Healer",
+                },
+                {
+                    "complete": False,
+                    "prefixText": "Heal an NPC\t",
+                    "requirementText": "Heal an NPC",
+                },
             ],
         },
         {
             "npcID": "npc_blacksmith",
-            "questState": "ReadyToTurnIn",
+            "questState": "COMPLETE",
             "questGiverName": "Blacksmith",
             "questID": "quest_free",
             "questName": "Open Contract",

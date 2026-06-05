@@ -9,20 +9,25 @@ Layout:
   levels, three fishing exp slots, five color pickers.
 * ``Unlockables`` tab — eight bulk-unlock buttons.
 * ``Quests`` tab     — scrollable list of every active quest. Each entry
-  shows the quest's name, ID, NPC, state, and requirement progress, and
-  has a toggle button to mark all its requirements complete / incomplete.
+  shows the quest's name, ID, NPC, state, and overall sub-task progress,
+  and renders one toggleable row per sub-task. Toggling a row flips the
+  checker's ``complete`` flag *and* bumps the underlying ``CURRENT_X``
+  progress value to ``TARGET_X``, so the game treats the sub-task as
+  actually done (see :mod:`permit_save_editor.quest_progress`).
 
 The data flow is one-directional: load populates the widgets from a
 ``GameSaveData``; save re-reads the widgets into the same model. Mirrors the
 C# ``SetInputValues`` / ``GetSaveDataAsJson`` pattern.
 
 The Quests tab is the one exception: its toggle buttons mutate the
-underlying quest dicts *in place*, so ``self._save`` stays in sync without
+underlying quest dicts *in place* (via ``mark_subtask_complete`` /
+``mark_subtask_incomplete``), so ``self._save`` stays in sync without
 going through ``_read_widgets_into_save``.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +36,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QColorDialog,
     QFileDialog,
     QFormLayout,
@@ -58,6 +64,7 @@ from ..io import (
 )
 from ..models import Color, GameSaveData
 from ..paths import default_save_dir
+from ..quest_progress import mark_subtask_complete, mark_subtask_incomplete
 from .theme import apply_theme
 
 # Validation ranges — copied from the WPF `IsValid` calls.
@@ -74,23 +81,8 @@ _FISHING3_RANGE = (0, 300)
 _NO_PATH = ""
 
 
-# Styles for the per-quest complete/incomplete toggle button. Two visual
-# states (green = complete, grey = incomplete) so the state is obvious
-# without having to read the label.
-_TOGGLE_COMPLETE_QSS = (
-    "QPushButton { background-color: #2e7d32; color: #fff; "
-    "border: 1px solid #1b5e20; padding: 4px 12px; border-radius: 3px; }"
-    "QPushButton:hover { background-color: #388e3c; }"
-)
-_TOGGLE_INCOMPLETE_QSS = (
-    "QPushButton { background-color: #424242; color: #fff; "
-    "border: 1px solid #616161; padding: 4px 12px; border-radius: 3px; }"
-    "QPushButton:hover { background-color: #4f4f4f; }"
-)
-_TOGGLE_DISABLED_QSS = (
-    "QPushButton { background-color: #303030; color: #777; "
-    "border: 1px solid #3a3a3a; padding: 4px 12px; border-radius: 3px; }"
-)
+# Styles for per-quest card and labels. Two label sizes (title bold,
+# subtitle/requirement grey) plus the card frame.
 _ENTRY_FRAME_QSS = (
     "QFrame { background-color: #2b2b2b; border: 1px solid #3f3f46; "
     "border-radius: 4px; }"
@@ -100,19 +92,57 @@ _SUBTITLE_QSS = "color: #999; font-size: 11px;"
 _STATUS_QSS = "color: #ccc; font-size: 11px;"
 
 
+# Pyglet-style inline color tags inside ``requirementText`` look like
+# ``<#ff1d1d>Blackpaw</color>``. Qt rich text doesn't understand that
+# syntax, so we convert each pair to a real ``<font color="#…">…</font>``
+# element before handing the string to a QLabel. Anything that doesn't
+# match is left as-is (so weird future variants just render verbatim).
+_COLOR_TAG_RE = re.compile(r"<#([0-9a-fA-F]{6})>(.*?)</color>", re.DOTALL)
+
+
+def _render_requirement_text(text: str) -> str:
+    """Convert Pyglet color tags in a requirementText into Qt rich text.
+
+    Examples
+    --------
+    >>> _render_requirement_text("Defeat <#ff1d1d>Blackpaw</color>\\t(2/5)")
+    'Defeat <font color="#ff1d1d">Blackpaw</font>\\t(2/5)'
+    """
+    return _COLOR_TAG_RE.sub(r'<font color="#\1">\2</font>', text)
+
+
+@dataclass
+class _SubTaskRow:
+    """A single sub-task's checkbox + the checker dict it controls.
+
+    The ``checker`` reference is the *original* dict inside
+    ``questRequirementCheckerList``. Toggling the checkbox mutates the
+    dict in place (via :func:`mark_subtask_complete` /
+    :func:`mark_subtask_incomplete`), so the save model stays in sync.
+    ``label`` is kept so tests / future code can find the row's text
+    widget without walking the whole frame's children.
+    """
+
+    checkbox: QCheckBox
+    label: QLabel
+    checker: dict[str, Any]
+
+
 @dataclass
 class _QuestEntry:
     """Per-quest widgets and a reference to its source dict.
 
     The ``quest`` reference is the *original* dict inside
-    ``self._save.active_quest_list``. Toggling the button mutates the
-    dict in place, so the save model stays in sync with the UI.
+    ``self._save.active_quest_list``. The ``subtasks`` list holds one
+    :class:`_SubTaskRow` per entry in ``questRequirementCheckerList``,
+    preserving the positional index for the CURRENT_X bump in
+    :mod:`permit_save_editor.quest_progress`.
     """
 
     frame: QFrame
     quest: dict[str, Any]
-    toggle: QPushButton
-    status_label: QLabel
+    subtasks: list[_SubTaskRow]
+    progress_label: QLabel  # "Sub-tasks: 1 / 3 complete"
 
 
 class MainWindow(QMainWindow):
@@ -396,7 +426,15 @@ class MainWindow(QMainWindow):
                 self._add_quest_entry(quest)
 
     def _add_quest_entry(self, quest: dict[str, Any]) -> None:
-        """Build one quest card and append it to the scrollable list."""
+        """Build one quest card and append it to the scrollable list.
+
+        The card shows the quest's metadata (name, ID, NPC, state) and
+        one toggleable row per sub-task in
+        ``questRequirementCheckerList``. Each row's checkbox is wired to
+        :func:`mark_subtask_complete` /
+        :func:`mark_subtask_incomplete` via
+        :meth:`_on_subtask_toggled`.
+        """
         frame = QFrame()
         frame.setFrameShape(QFrame.StyledPanel)
         frame.setStyleSheet(_ENTRY_FRAME_QSS)
@@ -427,93 +465,116 @@ class MainWindow(QMainWindow):
             subtitle.setWordWrap(True)
             col.addWidget(subtitle)
 
-        # Requirement progress — count `complete: True` in the checker list
+        # Sub-task progress label — updates as checkboxes toggle
         reqs = quest.get("questRequirementCheckerList")
-        if not isinstance(reqs, list) or not reqs:
-            status_text = "No requirement checkers"
+        has_reqs = isinstance(reqs, list) and len(reqs) > 0
+        if not has_reqs:
+            progress_text = "No sub-tasks"
         else:
             done = sum(
                 1
                 for r in reqs
                 if isinstance(r, dict) and r.get("complete") is True
             )
-            status_text = f"Requirements: {done} / {len(reqs)} complete"
-        status = QLabel(status_text)
-        status.setStyleSheet(_STATUS_QSS)
-        col.addWidget(status)
+            progress_text = f"Sub-tasks: {done} / {len(reqs)} complete"
+        progress = QLabel(progress_text)
+        progress.setStyleSheet(_STATUS_QSS)
+        col.addWidget(progress)
 
-        # Toggle row — right-aligned complete/incomplete button
-        toggle_row = QHBoxLayout()
-        toggle_row.setSpacing(6)
-        toggle_row.addStretch(1)
-        toggle = QPushButton("Mark Complete")
-        toggle.setCheckable(True)
-        toggle.setMinimumWidth(150)
-        has_reqs = isinstance(reqs, list) and len(reqs) > 0
-        if not has_reqs:
-            toggle.setEnabled(False)
-            toggle.setToolTip("This quest has no requirement checkers to toggle.")
-        is_complete = has_reqs and all(
-            isinstance(r, dict) and r.get("complete") is True for r in reqs
-        )
-        toggle.setChecked(is_complete)
-        self._style_quest_toggle(toggle, is_complete, enabled=has_reqs)
-        toggle.clicked.connect(
-            lambda _checked=False, t=toggle, e=len(self._quest_entries): (
-                self._on_quest_toggle(t, e)
-            )
-        )
-        toggle_row.addWidget(toggle)
-        col.addLayout(toggle_row)
+        # One checkbox row per sub-task
+        subtasks: list[_SubTaskRow] = []
+        if has_reqs:
+            entry_index = len(self._quest_entries)
+            for i, checker in enumerate(reqs):
+                if not isinstance(checker, dict):
+                    continue
+                subtasks.append(
+                    self._add_subtask_row(col, entry_index, i, checker)
+                )
 
         # Append before the trailing stretch
         last = self._quest_list_layout.count() - 1
         self._quest_list_layout.insertWidget(last, frame)
         self._quest_entries.append(
-            _QuestEntry(frame=frame, quest=quest, toggle=toggle, status_label=status)
+            _QuestEntry(
+                frame=frame,
+                quest=quest,
+                subtasks=subtasks,
+                progress_label=progress,
+            )
         )
 
-    @staticmethod
-    def _style_quest_toggle(btn: QPushButton, checked: bool, *, enabled: bool) -> None:
-        """Apply green/grey styling to a quest toggle button."""
-        if not enabled:
-            btn.setText("No requirements")
-            btn.setStyleSheet(_TOGGLE_DISABLED_QSS)
-            return
-        if checked:
-            btn.setText("Complete ✓")
-            btn.setStyleSheet(_TOGGLE_COMPLETE_QSS)
-        else:
-            btn.setText("Mark Complete")
-            btn.setStyleSheet(_TOGGLE_INCOMPLETE_QSS)
+    def _add_subtask_row(
+        self,
+        parent_layout: QVBoxLayout,
+        entry_index: int,
+        sub_task_index: int,
+        checker: dict[str, Any],
+    ) -> _SubTaskRow:
+        """Build one sub-task row (checkbox + requirement text) and wire it up.
 
-    def _on_quest_toggle(self, btn: QPushButton, entry_index: int) -> None:
-        """Mark all of a quest's requirement checkers complete / incomplete.
+        The checkbox's ``stateChanged`` signal is bound (via lambda with
+        captured indices) to :meth:`_on_subtask_toggled`, so the handler
+        can locate the right :class:`_QuestEntry` and the right checker
+        dict without scanning.
+        """
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.setContentsMargins(0, 0, 0, 0)
 
-        Mutates ``self._save.active_quest_list[i]`` in place so the save
-        model stays in sync with the UI without going through
-        ``_read_widgets_into_save``. Also refreshes the per-entry status
-        label so the "X / Y complete" counter updates immediately.
+        checkbox = QCheckBox()
+        checkbox.setChecked(checker.get("complete") is True)
+        row.addWidget(checkbox, 0, Qt.AlignTop)
+
+        text = str(
+            checker.get("requirementText") or checker.get("prefixText") or ""
+        ).rstrip("\t")
+        label = QLabel(_render_requirement_text(text))
+        label.setStyleSheet(_STATUS_QSS)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        row.addWidget(label, 1)
+
+        parent_layout.addLayout(row)
+
+        checkbox.stateChanged.connect(
+            lambda _state, e=entry_index, i=sub_task_index: self._on_subtask_toggled(
+                e, i
+            )
+        )
+        return _SubTaskRow(checkbox=checkbox, label=label, checker=checker)
+
+    def _on_subtask_toggled(self, entry_index: int, sub_task_index: int) -> None:
+        """Mark a single sub-task complete/incomplete and refresh the label.
+
+        Mutates ``self._save.active_quest_list[entry_index]`` in place
+        (via :func:`mark_subtask_complete` /
+        :func:`mark_subtask_incomplete`), which flips the checker's
+        ``complete`` flag and bumps the underlying ``CURRENT_X`` progress
+        value to ``TARGET_X`` so the game treats the sub-task as
+        actually done.
         """
         if entry_index < 0 or entry_index >= len(self._quest_entries):
             return
         entry = self._quest_entries[entry_index]
-        if btn is not entry.toggle:
-            # Stale signal (defensive — shouldn't happen with current wiring)
+        if sub_task_index < 0 or sub_task_index >= len(entry.subtasks):
             return
-        checked = btn.isChecked()
+        sub = entry.subtasks[sub_task_index]
+        if sub.checkbox.isChecked():
+            mark_subtask_complete(sub.checker, entry.quest, sub_task_index)
+        else:
+            mark_subtask_incomplete(sub.checker)
+        # Refresh the per-entry progress counter
         reqs = entry.quest.get("questRequirementCheckerList")
-        if not isinstance(reqs, list):
-            return
-        for r in reqs:
-            if isinstance(r, dict):
-                r["complete"] = bool(checked)
-        # Refresh the per-entry counter
-        done = sum(
-            1 for r in reqs if isinstance(r, dict) and r.get("complete") is True
-        )
-        entry.status_label.setText(f"Requirements: {done} / {len(reqs)} complete")
-        self._style_quest_toggle(btn, checked, enabled=True)
+        if isinstance(reqs, list) and reqs:
+            done = sum(
+                1
+                for r in reqs
+                if isinstance(r, dict) and r.get("complete") is True
+            )
+            entry.progress_label.setText(
+                f"Sub-tasks: {done} / {len(reqs)} complete"
+            )
 
     # -- small UI helpers ------------------------------------------------
 
